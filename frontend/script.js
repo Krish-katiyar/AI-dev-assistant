@@ -10,12 +10,15 @@ const runBtn = document.getElementById('runBtn');
 const runLabel = document.getElementById('runLabel');
 const outputBox = document.getElementById('outputBox');
 const apiUrlInput = document.getElementById('apiUrl');
+const apiDocsLink = document.getElementById('apiDocsLink');
+const engineBadge = document.getElementById('engineBadge');
 const statusDot = document.getElementById('statusDot');
 const lineCount = document.getElementById('lineCount');
 const fileInput = document.getElementById('fileInput');
 const historyContainer = document.getElementById('historyContainer');
 const favContainer = document.getElementById('favContainer');
 const themeToggle = document.getElementById('themeToggle');
+const API_URL_STORAGE_KEY = 'qyverix_api_url';
 
 // ── Theme ──
 const savedTheme = localStorage.getItem('qyverix_theme') || 'dark';
@@ -121,19 +124,150 @@ window.scrollToApp = scrollToApp;
 // ── Connection check ──
 async function checkConnection() {
   statusDot.className = 'status-dot checking';
+  const currentApi = getApiUrl();
+  const suggestedApi = normalizeApiUrl(getSuggestedApiUrl());
   try {
-    const resp = await fetch(`${getApiUrl()}/health`, { signal: AbortSignal.timeout(3000) });
-    statusDot.className = resp.ok ? 'status-dot online' : 'status-dot offline';
+    const resp = await fetch(`${currentApi}/health`, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) {
+      statusDot.className = 'status-dot offline';
+      setEngineBadge('unknown');
+      return;
+    }
+
+    const health = await resp.json().catch(() => ({}));
+    statusDot.className = 'status-dot online';
+    setEngineBadge(health.llm_enabled ? 'llm' : 'rule');
   } catch {
+    if (suggestedApi && suggestedApi !== currentApi) {
+      try {
+        const fallbackResp = await fetch(`${suggestedApi}/health`, { signal: AbortSignal.timeout(3000) });
+        if (fallbackResp.ok) {
+          const fallbackHealth = await fallbackResp.json().catch(() => ({}));
+          apiUrlInput.value = suggestedApi;
+          localStorage.setItem(API_URL_STORAGE_KEY, suggestedApi);
+          updateDocsLink();
+          statusDot.className = 'status-dot online';
+          setEngineBadge(fallbackHealth.llm_enabled ? 'llm' : 'rule');
+          return;
+        }
+      } catch {
+        // Keep offline state below if fallback fails.
+      }
+    }
+
     statusDot.className = 'status-dot offline';
+    setEngineBadge('unknown');
   }
 }
 
-function getApiUrl() {
-  return apiUrlInput.value.replace(/\/$/, '');
+function normalizeApiUrl(url) {
+  return (url || '').trim().replace(/\/$/, '');
 }
 
-apiUrlInput.addEventListener('change', checkConnection);
+function getHostname(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+function isLocalHostName(hostname) {
+  return hostname === 'localhost' || hostname === '127.0.0.1';
+}
+
+function getSuggestedApiUrl() {
+  if (window.location.protocol === 'file:') {
+    return 'http://localhost:8000';
+  }
+  return `${window.location.protocol}//${window.location.host}`;
+}
+
+function updateDocsLink() {
+  if (!apiDocsLink) return;
+  apiDocsLink.href = `${getApiUrl()}/docs`;
+}
+
+function setEngineBadge(mode) {
+  if (!engineBadge) return;
+
+  if (mode === 'llm') {
+    engineBadge.className = 'engine-badge llm';
+    engineBadge.textContent = 'Engine: LLM';
+    engineBadge.title = 'LLM mode active';
+    return;
+  }
+
+  if (mode === 'rule') {
+    engineBadge.className = 'engine-badge rule';
+    engineBadge.textContent = 'Engine: Rule-based';
+    engineBadge.title = 'Rule-based mode active';
+    return;
+  }
+
+  engineBadge.className = 'engine-badge unknown';
+  engineBadge.textContent = 'Engine: Unknown';
+  engineBadge.title = 'Engine status unavailable';
+}
+
+function initializeApiUrl() {
+  const saved = normalizeApiUrl(localStorage.getItem(API_URL_STORAGE_KEY));
+  const current = normalizeApiUrl(apiUrlInput.value);
+  const suggested = normalizeApiUrl(getSuggestedApiUrl());
+  const pageHost = window.location.hostname;
+
+  let chosen = saved || current || suggested;
+
+  if (
+    saved &&
+    window.location.protocol !== 'file:' &&
+    !isLocalHostName(pageHost) &&
+    isLocalHostName(getHostname(saved))
+  ) {
+    chosen = suggested;
+  }
+
+  apiUrlInput.value = chosen;
+  localStorage.setItem(API_URL_STORAGE_KEY, chosen);
+  updateDocsLink();
+}
+
+function getApiUrl() {
+  return normalizeApiUrl(apiUrlInput.value) || normalizeApiUrl(getSuggestedApiUrl());
+}
+
+function getUserFriendlyError(err, responseStatus) {
+  const raw = (err && err.message ? String(err.message) : '').toLowerCase();
+
+  if (raw.includes('failed to fetch') || raw.includes('networkerror') || raw.includes('network request failed')) {
+    return `Could not reach the backend at ${getApiUrl()}. Check the API URL and that the server is running.`;
+  }
+
+  if (responseStatus === 401) {
+    return 'Unauthorized request. Check your API key or auth settings.';
+  }
+
+  if (responseStatus === 402 || responseStatus === 429 || raw.includes('insufficient_quota') || raw.includes('quota')) {
+    return 'Provider quota/billing limit reached. Switch to rule-based mode or update billing.';
+  }
+
+  if (responseStatus >= 500) {
+    return 'Server error while analyzing code. Try again in a moment.';
+  }
+
+  if (err && err.message) {
+    return err.message;
+  }
+
+  return 'Could not reach the backend. Make sure it is running.';
+}
+
+initializeApiUrl();
+apiUrlInput.addEventListener('change', () => {
+  localStorage.setItem(API_URL_STORAGE_KEY, getApiUrl());
+  updateDocsLink();
+  checkConnection();
+});
 checkConnection();
 
 // ── Main Analysis ──
@@ -152,15 +286,17 @@ async function runAnalysis() {
   const url = `${getApiUrl()}/${currentMode === 'analyze' ? 'analyze' : currentMode}/`;
 
   try {
+    let responseStatus = 0;
     const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code })
     });
+    responseStatus = resp.status;
 
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP ${resp.status}`);
+      throw new Error(getUserFriendlyError({ message: err.detail || `HTTP ${resp.status}` }, responseStatus));
     }
 
     const data = await resp.json();
@@ -168,8 +304,9 @@ async function runAnalysis() {
     saveHistory(code, currentMode, data);
     statusDot.className = 'status-dot online';
   } catch (err) {
-    showError(err.message || 'Could not reach the backend. Make sure it is running.');
+    showError(getUserFriendlyError(err, 0));
     statusDot.className = 'status-dot offline';
+    setEngineBadge('unknown');
   } finally {
     runBtn.disabled = false;
     runBtn.classList.remove('loading');
